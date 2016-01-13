@@ -22,6 +22,8 @@ import contextlib
 import hashlib
 import logging
 import math
+import datetime
+import os
 
 from oslo_config import cfg
 from oslo_utils import units
@@ -35,6 +37,7 @@ from glance_store import exceptions
 from glance_store import i18n
 from glance_store.i18n import _
 from glance_store import location
+from glance_store import lichbd
 
 try:
     import rados
@@ -110,13 +113,16 @@ class StoreLocation(location.StoreLocation):
             return "rbd://%s" % self.image
 
     def parse_uri(self, uri):
+        #image_url = "rbd://images/%s" % (image_id)
+        #self.fsid, self.pool, self.image, self.snapshot = \
         prefix = 'rbd://'
         if not uri.startswith(prefix):
             reason = _('URI must start with rbd://')
-            msg = _LI("Invalid URI: %s") % reason
+            msg = _LI("Invalid URI, must start with rbd://: %s") % uri
 
             LOG.info(msg)
             raise exceptions.BadStoreUri(message=reason)
+
         # convert to ascii since librbd doesn't handle unicode
         try:
             ascii_uri = str(uri)
@@ -127,24 +133,10 @@ class StoreLocation(location.StoreLocation):
             LOG.info(msg)
             raise exceptions.BadStoreUri(message=reason)
         pieces = ascii_uri[len(prefix):].split('/')
-        if len(pieces) == 1:
-            self.fsid, self.pool, self.image, self.snapshot = \
-                (None, None, pieces[0], None)
-        elif len(pieces) == 4:
-            self.fsid, self.pool, self.image, self.snapshot = \
-                map(urllib.parse.unquote, pieces)
-        else:
-            reason = _('URI must have exactly 1 or 4 components')
-            msg = _LI("Invalid URI: %s") % reason
+        self.fsid, self.pool, self.image, self.snapshot = \
+                (None, pieces[0], pieces[1], None)
 
-            LOG.info(msg)
-            raise exceptions.BadStoreUri(message=reason)
-        if any(map(lambda p: p == '', pieces)):
-            reason = _('URI cannot contain empty components')
-            msg = _LI("Invalid URI: %s") % reason
-
-            LOG.info(msg)
-            raise exceptions.BadStoreUri(message=reason)
+        LOG.info("parse_url ok, url: %s, self.fsid: %s, self.pool: %s, self.image: %s, self.snapshot: %s", uri, self.fsid, self.pool, self.image, self.snapshot)
 
 
 class ImageIterator(object):
@@ -195,8 +187,9 @@ class Store(driver.Store):
 
     @contextlib.contextmanager
     def get_connection(self, conffile, rados_id):
-        LOG.info("%s, %s" % (conffile, rados_id))
-
+        lichbd.lichbd_mkdir("/lichbd/")
+        lichbd.lichbd_mkdir("/lichbd/images")
+        LOG.info("get connection %s, %s" % (conffile, rados_id))
 
     def configure_add(self):
         """
@@ -343,6 +336,16 @@ class Store(driver.Store):
 
     @capabilities.check
     def add(self, image_id, image_file, image_size, context=None):
+        lichbd.lichbd_mkdir("/lichbd/")
+        lichbd.lichbd_mkdir("/lichbd/images")
+
+        try:
+            return self._add(image_id, image_file, image_size, context)
+        except Exception, e:
+            LOG.error(e)
+            raise
+
+    def _add(self, image_id, image_file, image_size, context=None):
         """
         Stores an image file with supplied identifier to the backend
         storage system and returns a tuple containing information
@@ -363,37 +366,71 @@ class Store(driver.Store):
         image_name = str(image_id)
 
         image_path = "/lichbd/images/%s" % (image_id)
-        image_url = "rbd:images/%s" % (image_id)
+        image_url = "rbd://images/%s" % (image_id)
 
-        bytes_written = 0
-        offset = 0
-        chunks = utils.chunkreadable(image_file,
-                self.WRITE_CHUNKSIZE)
-        for chunk in chunks:
-            # If the image size provided is zero we need to do
-            # a resize for the amount we are writing. This will
-            # be slower so setting a higher chunk size may
-            # speed things up a bit.
-            if image_size == 0:
-                chunk_length = len(chunk)
-                length = offset + chunk_length
-                bytes_written += chunk_length
-                LOG.info(_("resizing image to %s KiB") %
-                        (length / units.Ki))
-                #todo 修改文件大小
-                #image.resize(length)
+        now = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
 
-            LOG.info(_("writing chunk at offset %s") %
-                    (offset))
-            #todo 写入文件
-            #offset += image.write(chunk, offset)
-            offset += len(chunk)
-            checksum.update(chunk)
+        tmpdir = "/tmp/tmpimg/"
+        cmd = "mkdir -p %s"%(tmpdir)
+        lichbd.call(cmd)
+
+        local_tmp_file =  os.path.join(tmpdir, "%s.%s"%(image_id, now))
+        local_tmp_file_raw = "%s.raw" % (local_tmp_file)
+        lichbd_file = os.path.join("/lichbd/images", image_id)
+        LOG.info("local_tmp_file: %s, local_tmp_dir: %s", local_tmp_file, os.path.dirname(local_tmp_file))
+
+        with open(local_tmp_file, "wb") as fp:
+            bytes_written = 0
+            offset = 0
+            chunks = utils.chunkreadable(image_file,
+                    self.WRITE_CHUNKSIZE)
+            for chunk in chunks:
+                # If the image size provided is zero we need to do
+                # a resize for the amount we are writing. This will
+                # be slower so setting a higher chunk size may
+                # speed things up a bit.
+                if image_size == 0:
+                    chunk_length = len(chunk)
+                    length = offset + chunk_length
+                    bytes_written += chunk_length
+                    LOG.info(_("resizing image to %s KiB") %
+                            (length / units.Ki))
+                    #todo resize
+                    #image.resize(length)
+    
+                LOG.info(_("writing chunk at offset %s") %
+                        (offset))
+                fp.write(chunk)
+                #offset += image.write(chunk, offset)
+                offset += len(chunk)
+                checksum.update(chunk)
+
+        file_format = lichbd.call("set -o pipefail; qemu-img info %s | grep 'file format' | cut -d ':' -f 2" % (local_tmp_file))
+        file_format = file_format.strip()
+
+        if file_format == 'qcow2':
+            lichbd.call('qemu-img convert -f qcow2 -O raw %s %s' % (local_tmp_file, local_tmp_file_raw))
+            src_path = ":%s" % (local_tmp_file_raw)
+        else:
+            src_path = ":%s" % (local_tmp_file)
+
+        dst_path = lichbd_file
+        try:
+            lichbd.lichbd_copy(src_path, dst_path)
+            lichbd.call('/opt/mds/lich/libexec/lich.snapshot --create %s@%s' % (dst_path, image_id))
+        except Exception, e:
+            lichbd.call('rm -rf %s' % (local_tmp_file))
+            lichbd.call('rm -rf %s' % (local_tmp_file_raw))
+            raise
+
+        lichbd.call('rm -rf %s' % (local_tmp_file))
+        lichbd.call('rm -rf %s' % (local_tmp_file_raw))
 
         # Make sure we send back the image size whether provided or inferred.
         if image_size == 0:
             image_size = bytes_written
 
+        LOG.info("%s create ok", image_path)
         return (image_url, image_size, checksum.hexdigest(), {})
 
     @capabilities.check
@@ -410,4 +447,8 @@ class Store(driver.Store):
         """
         loc = location.store_location
         target_pool = loc.pool or self.pool
-        self._delete_image(target_pool, loc.image, loc.snapshot)
+
+        path = "/lichbd/%s/%s" % (target_pool, loc.image)
+        lichbd.lichbd_unlink(path)
+        LOG.info("delete %s ok", path)
+        #self._delete_image(target_pool, loc.image, loc.snapshot)
