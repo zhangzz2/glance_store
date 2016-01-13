@@ -195,18 +195,8 @@ class Store(driver.Store):
 
     @contextlib.contextmanager
     def get_connection(self, conffile, rados_id):
-        client = rados.Rados(conffile=conffile, rados_id=rados_id)
+        LOG.info("%s, %s" % (conffile, rados_id))
 
-        try:
-            client.connect(timeout=self.connect_timeout)
-        except rados.Error:
-            msg = _LE("Error connecting to ceph cluster.")
-            LOG.exception(msg)
-            raise exceptions.BackendException()
-        try:
-            yield client
-        finally:
-            client.shutdown()
 
     def configure_add(self):
         """
@@ -367,76 +357,44 @@ class Store(driver.Store):
         :raises `glance_store.exceptions.Duplicate` if the image already
                 existed
         """
+        LOG.info("image_id: %s,  image_file: %s, image_size: %s, context: %s" % (image_id, image_file, image_size, context))
+
         checksum = hashlib.md5()
         image_name = str(image_id)
-        with self.get_connection(conffile=self.conf_file,
-                                 rados_id=self.user) as conn:
-            fsid = None
-            if hasattr(conn, 'get_fsid'):
-                fsid = conn.get_fsid()
-            with conn.open_ioctx(self.pool) as ioctx:
-                order = int(math.log(self.WRITE_CHUNKSIZE, 2))
-                LOG.debug('creating image %s with order %d and size %d',
-                          image_name, order, image_size)
-                if image_size == 0:
-                    LOG.warning(_("since image size is zero we will be doing "
-                                  "resize-before-write for each chunk which "
-                                  "will be considerably slower than normal"))
 
-                try:
-                    loc = self._create_image(fsid, conn, ioctx, image_name,
-                                             image_size, order)
-                except rbd.ImageExists:
-                    msg = _('RBD image %s already exists') % image_id
-                    raise exceptions.Duplicate(message=msg)
+        image_path = "/lichbd/images/%s" % (image_id)
+        image_url = "rbd:images/%s" % (image_id)
 
-                try:
-                    with rbd.Image(ioctx, image_name) as image:
-                        bytes_written = 0
-                        offset = 0
-                        chunks = utils.chunkreadable(image_file,
-                                                     self.WRITE_CHUNKSIZE)
-                        for chunk in chunks:
-                            # If the image size provided is zero we need to do
-                            # a resize for the amount we are writing. This will
-                            # be slower so setting a higher chunk size may
-                            # speed things up a bit.
-                            if image_size == 0:
-                                chunk_length = len(chunk)
-                                length = offset + chunk_length
-                                bytes_written += chunk_length
-                                LOG.debug(_("resizing image to %s KiB") %
-                                          (length / units.Ki))
-                                image.resize(length)
-                            LOG.debug(_("writing chunk at offset %s") %
-                                      (offset))
-                            offset += image.write(chunk, offset)
-                            checksum.update(chunk)
-                        if loc.snapshot:
-                            image.create_snap(loc.snapshot)
-                            image.protect_snap(loc.snapshot)
-                except Exception as exc:
-                    log_msg = (_LE("Failed to store image %(img_name)s "
-                                   "Store Exception %(store_exc)s") %
-                               {'img_name': image_name,
-                                'store_exc': exc})
-                    LOG.error(log_msg)
+        bytes_written = 0
+        offset = 0
+        chunks = utils.chunkreadable(image_file,
+                self.WRITE_CHUNKSIZE)
+        for chunk in chunks:
+            # If the image size provided is zero we need to do
+            # a resize for the amount we are writing. This will
+            # be slower so setting a higher chunk size may
+            # speed things up a bit.
+            if image_size == 0:
+                chunk_length = len(chunk)
+                length = offset + chunk_length
+                bytes_written += chunk_length
+                LOG.info(_("resizing image to %s KiB") %
+                        (length / units.Ki))
+                #todo 修改文件大小
+                #image.resize(length)
 
-                    # Delete image if one was created
-                    try:
-                        target_pool = loc.pool or self.pool
-                        self._delete_image(target_pool, loc.image,
-                                           loc.snapshot)
-                    except exceptions.NotFound:
-                        pass
-
-                    raise exc
+            LOG.info(_("writing chunk at offset %s") %
+                    (offset))
+            #todo 写入文件
+            #offset += image.write(chunk, offset)
+            offset += len(chunk)
+            checksum.update(chunk)
 
         # Make sure we send back the image size whether provided or inferred.
         if image_size == 0:
             image_size = bytes_written
 
-        return (loc.get_uri(), image_size, checksum.hexdigest(), {})
+        return (image_url, image_size, checksum.hexdigest(), {})
 
     @capabilities.check
     def delete(self, location, context=None):
