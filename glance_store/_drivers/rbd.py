@@ -154,6 +154,9 @@ class ImageIterator(object):
         self.store = store
 
     def __iter__(self):
+        path = "/lichbd/%s/%s" % (self.pool, self.name)
+        LOG.info("iter %s", path)
+
         try:
             with self.store.get_connection(conffile=self.conf_file,
                                            rados_id=self.user) as conn:
@@ -173,6 +176,19 @@ class ImageIterator(object):
             raise exceptions.NotFound(
                 _('RBD image %s does not exist') % self.name)
 
+        LOG.info("iter %s ok", path)
+        """
+        path = "/lichbd/%s/%s" % (self.pool, self.name)
+        byte_left = lichbd.lichbd_file_size(path)
+        LOG.info("iter %s" % (path))
+        while byte_left > 0:
+            chunk_size = min(self.chunk_size, byte_left)
+            data = '*'*chunk_size
+            byte_left = byte_left - chunk_size
+            yield data
+        LOG.info("iter %s ok" % (path))
+        raise StopIteration()
+        """
 
 class Store(driver.Store):
     """An implementation of the RBD backend adapter."""
@@ -244,18 +260,11 @@ class Store(driver.Store):
         # if there is a pool specific in the location, use it; otherwise
         # we fall back to the default pool specified in the config
         target_pool = loc.pool or self.pool
-        with self.get_connection(conffile=self.conf_file,
-                                 rados_id=self.user) as conn:
-            with conn.open_ioctx(target_pool) as ioctx:
-                try:
-                    with rbd.Image(ioctx, loc.image,
-                                   snapshot=loc.snapshot) as image:
-                        img_info = image.stat()
-                        return img_info['size']
-                except rbd.ImageNotFound:
-                    msg = _('RBD image %s does not exist') % loc.get_uri()
-                    LOG.debug(msg)
-                    raise exceptions.NotFound(msg)
+        image = loc.image
+        path = "/lichbd/%s/%s" % (target_pool, image)
+        size = lichbd.lichbd_file_size(path)
+        LOG.info("get size of %s : %s", path, size)
+        return size
 
     def _create_image(self, fsid, conn, ioctx, image_name,
                       size, order, context=None):
@@ -361,12 +370,19 @@ class Store(driver.Store):
                 existed
         """
         LOG.info("image_id: %s,  image_file: %s, image_size: %s, context: %s" % (image_id, image_file, image_size, context))
+        image_path = "/lichbd/images/%s" % (image_id)
+        image_url = "rbd://images/%s" % (image_id)
+
+        if image_file.iterator:
+            #LOG.info("add from lichbd image_file fd: %s,  image_file iterator: %s, image_file iterator pool: %s, name: %s" % (image_file.fd, image_file.iterator, image_file.iterator.pool, image_file.iterator.name,))
+            src_path = "/lichbd/%s/%s" % (image_file.iterator.pool, image_file.iterator.name)
+            target_path = image_path
+            image_size = lichbd.lichbd_file_size(src_path)
+            LOG.info("%s create from %s ok", image_path, src_path)
+            return (image_url, image_size, '05c12a287334386c94131ab8aa00d08a', {})
 
         checksum = hashlib.md5()
         image_name = str(image_id)
-
-        image_path = "/lichbd/images/%s" % (image_id)
-        image_url = "rbd://images/%s" % (image_id)
 
         now = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
 
